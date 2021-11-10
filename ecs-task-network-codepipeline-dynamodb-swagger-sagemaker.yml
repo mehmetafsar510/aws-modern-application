@@ -1,0 +1,1520 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This stack deploys the core network infrastructure and IAM resources
+             to be used for a service hosted in Amazon ECS using AWS Fargate.
+Parameters:
+  UserName:
+    Type: String
+  CognitoDomain:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: ^[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?$
+    Description: Enter a string. Must be alpha numeric 3-63 in length.
+    Default:        mehmetafsar
+  KeyName:
+    Description: The EC2 Key Pair to allow SSH access to the instance
+    Type: 'AWS::EC2::KeyPair::KeyName'
+  Ec2ImageId:
+    Description: AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  ServiceName:
+    Type: String
+    Default: claruswaymehmet2514
+    Description: A name for the service
+  Name:
+    Type: String
+    Default: clarusway
+    Description: A name for the service
+  OperatorEMail:
+    Description: EMail address to notify if there are any scaling operations
+    Type: String
+    AllowedPattern: ([a-zA-Z0-9_\-\.]+)@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.)|(([a-zA-Z0-9\-]+\.)+))([a-zA-Z]{2,4}|[0-9]{1,3})(\]?)
+    ConstraintDescription: must be a valid email address.
+    Default: drmehmet510@gmail.com
+  AppName:
+    Type: String
+    Description: Name of app requiring ELB exposure
+    Default: simple-app
+  AppContainerPort:
+    Type: Number
+    Description: Container port of app requiring ELB exposure
+    Default: '8080'
+  ContainerCpu:
+    Type: Number
+    Default: '256'
+    Description: How much CPU to give the container. 1024 is 1 CPU
+  ContainerMemory:
+    Type: Number
+    Default: '512'
+    Description: How much memory in megabytes to give the container
+  Path:
+    Type: String
+    Default: "*"
+    Description: A path on the public load balancer that this service
+                 should be connected to. Use * to send all load balancer
+                 traffic to this service.
+
+
+
+Mappings:
+  # Hard values for the subnet masks. These masks define
+  # the range of internal IP addresses that can be assigned.
+  # The VPC can have all IP's from 10.0.0.0 to 10.0.255.255
+  # There are four subnets which cover the ranges:
+  #
+  # 10.0.0.0 - 10.0.0.255
+  # 10.0.1.0 - 10.0.1.255
+  # 10.0.2.0 - 10.0.2.255
+  # 10.0.3.0 - 10.0.3.255
+  #
+  # If you need more IP addresses (perhaps you have so many
+  # instances that you run out) then you can customize these
+  # ranges to add more
+  SubnetConfig:
+    VPC:
+      CIDR: '10.0.0.0/16'
+    PublicOne:
+      CIDR: '10.0.0.0/24'
+    PublicTwo:
+      CIDR: '10.0.1.0/24'
+    PrivateOne:
+      CIDR: '10.0.2.0/24'
+    PrivateTwo:
+      CIDR: '10.0.3.0/24'
+Resources:
+  # VPC in which containers will be networked.
+  # It has two public subnets, and two private subnets.
+  # We distribute the subnets across the first two available subnets
+  # for the region, for high availability.
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !FindInMap ['SubnetConfig', 'VPC', 'CIDR']
+
+  # Two public subnets, where a public load balancer will later be created.
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+         Fn::Select:
+         - 0
+         - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref 'VPC'
+      CidrBlock: !FindInMap ['SubnetConfig', 'PublicOne', 'CIDR']
+      MapPublicIpOnLaunch: true
+  PublicSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+         Fn::Select:
+         - 1
+         - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref 'VPC'
+      CidrBlock: !FindInMap ['SubnetConfig', 'PublicTwo', 'CIDR']
+      MapPublicIpOnLaunch: true
+
+  # Two private subnets where containers will only have private
+  # IP addresses, and will only be reachable by other members of the
+  # VPC
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+         Fn::Select:
+         - 0
+         - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref 'VPC'
+      CidrBlock: !FindInMap ['SubnetConfig', 'PrivateOne', 'CIDR']
+  PrivateSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+         Fn::Select:
+         - 1
+         - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref 'VPC'
+      CidrBlock: !FindInMap ['SubnetConfig', 'PrivateTwo', 'CIDR']
+
+  # Setup networking resources for the public subnets.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref 'VPC'
+      InternetGatewayId: !Ref 'InternetGateway'
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachement
+    Properties:
+      RouteTableId: !Ref 'PublicRouteTable'
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref 'InternetGateway'
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetTwo
+      RouteTableId: !Ref PublicRouteTable
+
+  # Setup networking resources for the private subnets. Containers
+  # in these subnets have only private IP addresses, and must use a NAT
+  # gateway to talk to the internet. We launch two NAT gateways, one for
+  # each private subnet.
+  NatGatewayOneAttachment:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachement
+    Properties:
+        Domain: vpc
+  NatGatewayTwoAttachment:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachement
+    Properties:
+        Domain: vpc
+  NatGatewayOne:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayOneAttachment.AllocationId
+      SubnetId: !Ref PublicSubnetOne
+  NatGatewayTwo:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayTwoAttachment.AllocationId
+      SubnetId: !Ref PublicSubnetTwo
+  PrivateRouteTableOne:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+  PrivateRouteOne:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableOne
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayOne
+  PrivateRouteTableOneAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableOne
+      SubnetId: !Ref PrivateSubnetOne
+  PrivateRouteTableTwo:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+  PrivateRouteTwo:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableTwo
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayTwo
+  PrivateRouteTableTwoAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableTwo
+      SubnetId: !Ref PrivateSubnetTwo
+
+  # VPC Endpoint for DynamoDB
+  # If a container needs to access DynamoDB (coming in module 3) this
+  # allows a container in the private subnet to talk to DynamoDB directly
+  # without needing to go via the NAT gateway.
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "*"
+            Principal: "*"
+            Resource: "*"
+      RouteTableIds:
+        - !Ref 'PrivateRouteTableOne'
+        - !Ref 'PrivateRouteTableTwo'
+      ServiceName: !Join [ "", [ "com.amazonaws.", { "Ref": "AWS::Region" }, ".dynamodb" ] ]
+      VpcId: !Ref 'VPC'
+
+
+
+  # The security group for our service containers to be hosted in Fargate.
+  # Even though traffic from users will pass through a Network Load Balancer,
+  # that traffic is purely TCP passthrough, without security group inspection.
+  # Therefore, we will allow for traffic from the Internet to be accepted by our
+  # containers.  But, because the containers will only have Private IP addresses,
+  # the only traffic that will reach the containers is traffic that is routed
+  # to them by the public load balancer on the specific ports that we configure.
+  FargateContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the fargate containers from the Internet
+      VpcId: !Ref 'VPC'
+      SecurityGroupIngress:
+          # Allow access to NLB from anywhere on the internet
+          - CidrIp: !FindInMap ['SubnetConfig', 'VPC', 'CIDR']
+            IpProtocol: -1
+
+  EC2FullAccessToS3ECR:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess  
+        - arn:aws:iam::aws:policy/AWSCodeCommitFullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/IAMFullAccess
+        - arn:aws:iam::aws:policy/AdministratorAccess  #sam cli
+  EC2toS3ECRProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles: #required
+        - !Ref EC2FullAccessToS3ECR
+  DockerMachineSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP and SSH for Docker Machine
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref 'VPC'
+  DockerMachine:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref Ec2ImageId
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref EC2toS3ECRProfile
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet: 
+            - Ref: "DockerMachineSecurityGroup"
+          SubnetId: 
+            Ref: "PublicSubnetOne"
+      Tags:                
+        -                        
+          Key: Name
+          Value: !Sub Docker Machine of ${AWS::StackName}   
+      UserData: !Base64
+        Fn::Sub: 
+          - |
+            #! /bin/bash
+            yum update -y
+            yum install git -y
+            yum install zip -y
+            amazon-linux-extras install docker -y
+            systemctl start docker
+            systemctl enable docker
+            usermod -a -G docker ec2-user
+            mkdir -p /home/ec2-user/pipeline
+            cd /home/ec2-user/pipeline
+            aws s3 cp s3://mehmetafsar.com/app.zip .
+            unzip app.zip
+            docker build . -t ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/mehmet/service:latest
+            aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+            docker push ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/mehmet/service:latest
+            aws s3 cp s3://mehmetafsar.com/index.html .
+            sed -i "s|'REPLACE_ME'|'http://${MyELBURI}'|g" index.html
+            aws s3 cp ./index.html s3://${ServiceName}
+            cd /home/ec2-user/
+            ssh-keygen -b 2048 -t rsa -f /home/ec2-user/.ssh/codecommit -q -N ""
+
+            KEY_ID=`aws iam  upload-ssh-public-key --user-name ${UserName} --ssh-public-key-body "$(cat /home/ec2-user/.ssh/codecommit.pub)" \
+              --query 'SSHPublicKey.SSHPublicKeyId' --output text`
+
+            echo -e "
+            Host git-codecommit.*.amazonaws.com
+              User $KEY_ID
+              IdentityFile /home/ec2-user/.ssh/codecommit
+            " >> /home/ec2-user/.ssh/config
+
+            ssh-keyscan -t rsa git-codecommit.${AWS::Region}.amazonaws.com >> /home/ec2-user/.ssh/known_hosts
+
+            chown -R ec2-user:ec2-user /home/ec2-user/.ssh
+            chmod 700 /home/ec2-user/.ssh
+            chmod 644 /home/ec2-user/.ssh/*
+            chmod 600 /home/ec2-user/.ssh/codecommit*
+
+            eval "$(ssh-agent -s)"
+
+            export GIT_SSH_COMMAND="ssh -v -F /home/ec2-user/.ssh/config -o StrictHostKeyChecking=no"
+            export GIT_TRACE_PACKET=true
+            export GIT_TRACE=2
+            export GIT_CURL_VERBOSE=1
+            sleep 60
+            git clone ssh://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/MythicalMysfitsService-Repository
+
+            cp -r /home/ec2-user/pipeline/* /home/ec2-user/MythicalMysfitsService-Repository/
+            cd /home/ec2-user/MythicalMysfitsService-Repository/service
+            sed -i "s/43/1453/g" mysfits-response.json
+            cd /home/ec2-user/MythicalMysfitsService-Repository/
+            git add .
+            git commit -m "I changed the age of one of the mysfits."
+            git push
+            aws dynamodb batch-write-item --request-items fileb:///home/ec2-user/pipeline/populate-dynamodb.json --region ${AWS::Region}
+            sleep 360
+            cd /home/ec2-user/
+            aws s3 cp s3://mehmetafsar.com/service.zip .
+            unzip service.zip
+            cp /home/ec2-user/service/* /home/ec2-user/MythicalMysfitsService-Repository/service
+            cd /home/ec2-user/MythicalMysfitsService-Repository/
+            git add .
+            git commit -m "Add new integration to DynamoDB."
+            git push
+            sleep 540
+            mkdir -p /home/ec2-user/web
+            cd /home/ec2-user/web
+            aws s3 cp s3://mehmetafsar.com/web.zip .
+            unzip web.zip
+            sed -i "s|'REPLACE_ME1'|'https://${MyRestAPI}.execute-api.${AWS::Region}.amazonaws.com/prod'|g" index.html
+            sed -i "s|'REPLACE_ME2'|'${UserPool}'|g" index.html
+            sed -i "s|'REPLACE_ME3'|'${CognitoUserPoolClient}'|g" index.html
+            sed -i "s|'REPLACE_ME4'|'${AWS::Region}'|g" index.html
+            sed -i "s|'REPLACE_ME1'|'${UserPool}'|g" confirm.html
+            sed -i "s|'REPLACE_ME2'|'${CognitoUserPoolClient}'|g" confirm.html
+            sed -i "s|'REPLACE_ME1'|'${UserPool}'|g" register.html
+            sed -i "s|'REPLACE_ME2'|'${CognitoUserPoolClient}'|g" register.html
+            aws s3 cp ./index.html s3://${ServiceName}
+            aws s3 cp ./confirm.html s3://${ServiceName}
+            aws s3 cp ./register.html s3://${ServiceName}
+            aws s3 cp ./js s3://${ServiceName}/js --recursive
+            mkdir -p /home/ec2-user/cognito
+            cd /home/ec2-user/cognito
+            aws s3 cp s3://mehmetafsar.com/cognito.zip .
+            unzip cognito.zip
+            cp -R /home/ec2-user/cognito/* /home/ec2-user/MythicalMysfitsService-Repository/
+            cd /home/ec2-user/MythicalMysfitsService-Repository/
+            git add .
+            git commit -m "Update service code backend to enable additional website features."
+            git push
+            sleep 600
+            cd /home/ec2-user/
+            git clone ssh://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/MythicalMysfitsStreamingService-Repository
+            aws s3 cp s3://mehmetafsar.com/cfn.zip .
+            unzip cfn.zip
+            cd /home/ec2-user/MythicalMysfitsStreamingService-Repository
+            cp /home/ec2-user/streaming/* .
+            cp /home/ec2-user/cfn/* .
+            pip3 install requests -t .
+            sed -i "s|'REPLACE_ME_API_ENDPOINT'|'https://${MyRestAPI}.execute-api.${AWS::Region}.amazonaws.com/prod'|g" streamProcessor.py
+            cd /home/ec2-user/
+            wget https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip
+            sha256sum aws-sam-cli-linux-x86_64.zip
+            unzip aws-sam-cli-linux-x86_64.zip -d sam-installation
+            ./sam-installation/install
+            chmod 777 /home/ec2-user/MythicalMysfitsStreamingService-Repository
+            cd /home/ec2-user/MythicalMysfitsStreamingService-Repository
+            aws s3 cp s3://mehmetafsar-terraform/index.html .
+            sed -i "s|'REPLACE_ME1'|'https://${MyRestAPI}.execute-api.${AWS::Region}.amazonaws.com/prod'|g" index.html
+            sed -i "s|'REPLACE_ME2'|'${UserPool}'|g" index.html
+            sed -i "s|'REPLACE_ME3'|'${CognitoUserPoolClient}'|g" index.html
+            sed -i "s|'REPLACE_ME4'|'${AWS::Region}'|g" index.html
+            aws s3 cp ./index.html s3://${ServiceName}
+            sam package --template-file ./real-time-streaming.yml --output-template-file ./transformed-streaming.yml --s3-bucket ${ServiceName} --region ${AWS::Region}
+            aws cloudformation deploy --template-file /home/ec2-user/MythicalMysfitsStreamingService-Repository/transformed-streaming.yml --stack-name MythicalMysfitsStreamingStack --capabilities CAPABILITY_IAM --region ${AWS::Region}
+            git add .
+            git commit -m "New stream processing service."
+            git push
+            sleep 360
+            cd /home/ec2-user/
+            aws s3 cp s3://mehmetafsar.com/customer.zip .
+            unzip customer.zip
+            git clone ssh://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/MythicalMysfitsQuestionsService-Repository
+            chmod 777 /home/ec2-user/MythicalMysfitsQuestionsService-Repository
+            cd /home/ec2-user/MythicalMysfitsQuestionsService-Repository
+            cp -R  /home/ec2-user/app1/* .
+            cp /home/ec2-user/cfn1/* .
+            aws s3 mb s3://questionstream2514 --region ${AWS::Region}
+            sam package --template-file ./customer-questions.yml --output-template-file ./transformed-streaming.yml --s3-bucket questionstream2514 --region ${AWS::Region}
+            aws cloudformation deploy --template-file /home/ec2-user/MythicalMysfitsQuestionsService-Repository/transformed-streaming.yml --stack-name MythicalMysfitsQuestionsServiceStack --capabilities CAPABILITY_IAM --region ${AWS::Region}
+            git add .
+            git commit -m "New question service."
+            git push
+            sleep 960
+            cd /home/ec2-user/MythicalMysfitsQuestionsService-Repository/PostQuestionsService
+            sed -i "s|#from aws_xray_sdk.core import xray_recorder|from aws_xray_sdk.core import xray_recorder|g" mysfitsPostQuestion.py
+            sed -i "s|#from aws_xray_sdk.core import patch_all|from aws_xray_sdk.core import patch_all|g" mysfitsPostQuestion.py
+            sed -i "s|#patch_all()|patch_all()|g" mysfitsPostQuestion.py
+            cd /home/ec2-user/MythicalMysfitsQuestionsService-Repository/ProcessQuestionsStream
+            sed -i "s|#from aws_xray_sdk.core import xray_recorder|from aws_xray_sdk.core import xray_recorder|g" mysfitsProcessStream.py
+            sed -i "s|#from aws_xray_sdk.core import patch_all|from aws_xray_sdk.core import patch_all|g" mysfitsProcessStream.py
+            sed -i "s|#patch_all()|patch_all()|g" mysfitsProcessStream.py
+            sam package --template-file /home/ec2-user/MythicalMysfitsQuestionsService-Repository/customer-questions.yml --output-template-file /home/ec2-user/MythicalMysfitsQuestionsService-Repository/transformed-questions1.yml --s3-bucket questionstream2514 --region ${AWS::Region}
+            aws cloudformation deploy --template-file /home/ec2-user/MythicalMysfitsQuestionsService-Repository/transformed-questions1.yml --stack-name MythicalMysfitsQuestionsService-Stack --capabilities CAPABILITY_IAM --region ${AWS::Region}
+            aws sagemaker create-notebook-instance --notebook-instance-name MythicalMysfits-SageMaker-Notebook --instance-type ml.t2.medium --role arn:aws:iam::${AWS::AccountId}:role/MysfitsNotbookRole --region ${AWS::Region}
+            cd /home/ec2-user/
+            aws s3 cp s3://mehmetafsar.com/sagemaker.zip .
+            unzip sagemaker.zip
+            git clone ssh://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/MythicalMysfitsRecommendationService-Repository
+            chmod 777 /home/ec2-user/MythicalMysfitsRecommendationService-Repository
+            aws s3 mb s3://sagemaker2514 --region ${AWS::Region}
+            cp -R /home/ec2-user/app/service/ /home/ec2-user/MythicalMysfitsRecommendationService/
+            cd /home/ec2-user/MythicalMysfitsRecommendationService/service/
+            aws sagemaker list-endpoints > /home/ec2-user/sagemaker-endpoints.json
+            MY=$(grep -E '\bk' sagemaker-endpoints.json)
+            sed -i 's|"REPLACE_ME_SAGEMAKER_ENDPOINT_NAME"|"'"${MY}"'"|g' recommendation.py
+            sam package --template-file /home/ec2-user/MythicalMysfitsRecommendationService/service/cfn/recommendations-service.yml --output-template-file /home/ec2-user/MythicalMysfitsRecommendationService/transformed-recommendations.yml --s3-bucket sagemaker2514 --region ${AWS::Region}
+            aws cloudformation deploy --template-file /home/ec2-user/MythicalMysfitsRecommendationService/transformed-recommendations.yml --stack-name MythicalMysfitsRecommendationsStack --capabilities CAPABILITY_NAMED_IAM --region ${AWS::Region}
+          - MyELBURI: !GetAtt PublicNetworkLoadBalancer.DNSName
+    # sed -e 's/.*took \([0-9.]*\).*/\1/g'      
+  MyRestAPI:   
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: Player API
+      FailOnWarnings: true
+      Parameters:
+          endpointConfigurationTypes: REGIONAL
+      Description: A demo API for Player management
+      Body:
+        swagger: 2
+        info:
+          title: MysfitsApi
+        securityDefinitions:
+          MysfitsUserPoolAuthorizer:
+            type: apiKey
+            name: Authorization
+            in: header
+            x-amazon-apigateway-authtype: cognito_user_pools
+            x-amazon-apigateway-authorizer:
+              type: COGNITO_USER_POOLS
+              providerARNs:
+              - !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPool} #REPLACE_ME_COGNITO_USER_POOL_ID
+        paths:
+          "/":
+            get:
+              responses:
+                '200':
+                  description: Default response for CORS method
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+              x-amazon-apigateway-integration:
+                connectionType: VPC_LINK
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+                      method.response.header.Access-Control-Allow-Methods: "'*'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                connectionId: !Ref MyVpclink #REPLACE_ME_VPC_LINK_ID
+                httpMethod: GET
+                type: HTTP_PROXY
+                uri: !Join ["", ['http://', !GetAtt PublicNetworkLoadBalancer.DNSName, '/']] #http://REPLACE_ME_NLB_DNS/
+            options:
+              summary: CORS support
+              description: 'Enable CORS by returning correct headers'
+              consumes:
+              - application/json
+              produces:
+              - application/json
+              tags:
+              - CORS
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: |
+                    {
+                      "statusCode" : 200
+                    }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+                      method.response.header.Access-Control-Allow-Methods: "'*'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                    responseTemplates:
+                      application/json: "{}\n"
+              responses:
+                '200':
+                  description: Default response for CORS method
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+          "/mysfits":
+            get:
+              responses:
+                '200':
+                  description: Default response for CORS method
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+              x-amazon-apigateway-integration:
+                connectionType: VPC_LINK
+                connectionId: !Ref MyVpclink #REPLACE_ME_VPC_LINK_ID
+                httpMethod: GET
+                type: HTTP_PROXY
+                uri:  !Join ["", ['http://', !GetAtt PublicNetworkLoadBalancer.DNSName, '/mysfits']] #http://REPLACE_ME_NLB_DNS/mysfits
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+                      method.response.header.Access-Control-Allow-Methods: "'*'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+            options:
+              summary: CORS support
+              description: 'Enable CORS by returning correct headers'
+              consumes:
+              - application/json
+              produces:
+              - application/json
+              tags:
+              - CORS
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: |
+                    {
+                      "statusCode" : 200
+                    }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+                      method.response.header.Access-Control-Allow-Methods: "'*'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                    responseTemplates:
+                      application/json: "{}\n"
+              responses:
+                '200':
+                  description: Default response for CORS method
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+          "/mysfits/{mysfitId}":
+            get:
+              parameters:
+              - name: mysfitId
+                in: path
+                required: true
+                type: string
+              responses:
+                '200':
+                  description: Default response for CORS method
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+              x-amazon-apigateway-integration:
+                requestParameters:
+                  integration.request.path.mysfitId: method.request.path.mysfitId
+                connectionType: VPC_LINK
+                connectionId: !Ref MyVpclink #REPLACE_ME_VPC_LINK_ID
+                httpMethod: GET
+                type: HTTP_PROXY
+                uri: !Join ["", ['http://', !GetAtt PublicNetworkLoadBalancer.DNSName, '/mysfits/{mysfitId}']]  #http://REPLACE_ME_NLB_DNS/mysfits/{mysfitId} 
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+                      method.response.header.Access-Control-Allow-Methods: "'*'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+            options:
+              summary: CORS support
+              description: 'Enable CORS by returning correct headers'
+              consumes:
+              - application/json
+              produces:
+              - application/json
+              tags:
+              - CORS
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: |
+                    {
+                      "statusCode" : 200
+                    }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+                      method.response.header.Access-Control-Allow-Methods: "'*'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                    responseTemplates:
+                      application/json: "{}\n"
+              responses:
+                '200':
+                  description: Default response for CORS method
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+          "/mysfits/{mysfitId}/adopt":
+            post:
+              parameters:
+              - name: mysfitId
+                in: path
+                required: true
+                type: string
+              responses:
+                '200':
+                  description: Default response for CORS method
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+              security:
+              - MysfitsUserPoolAuthorizer: []
+              x-amazon-apigateway-integration:
+                requestParameters:
+                  integration.request.path.mysfitId: method.request.path.mysfitId
+                connectionType: VPC_LINK
+                connectionId: !Ref MyVpclink #REPLACE_ME_VPC_LINK_ID
+                httpMethod: POST
+                type: HTTP_PROXY
+                uri: !Join ["", ['http://', !GetAtt PublicNetworkLoadBalancer.DNSName, '/mysfits/{mysfitId}/adopt']] #http://REPLACE_ME_NLB_DNS/mysfits/{mysfitId}/adopt
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+                      method.response.header.Access-Control-Allow-Methods: "'*'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+            options:
+              summary: CORS support
+              description: 'Enable CORS by returning correct headers'
+              consumes:
+              - application/json
+              produces:
+              - application/json
+              tags:
+              - CORS
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: |
+                    {
+                      "statusCode" : 200
+                    }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+                      method.response.header.Access-Control-Allow-Methods: "'*'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                    responseTemplates:
+                      application/json: "{}\n"
+              responses:
+                '200':
+                  description: Default response for CORS method
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+          "/mysfits/{mysfitId}/like":
+            post:
+              parameters:
+              - name: mysfitId
+                in: path
+                required: true
+                type: string
+              responses:
+                '200':
+                  description: Default response for CORS method
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+              security:
+              - MysfitsUserPoolAuthorizer: []
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+                      method.response.header.Access-Control-Allow-Methods: "'*'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestParameters:
+                  integration.request.path.mysfitId: method.request.path.mysfitId
+                connectionType: VPC_LINK
+                connectionId: !Ref MyVpclink #REPLACE_ME_VPC_LINK_ID
+                httpMethod: POST
+                security:
+                - MysfitsUserPoolAuthorizer: []
+                type: HTTP_PROXY
+                uri: !Join ["", ['http://', !GetAtt PublicNetworkLoadBalancer.DNSName, '/mysfits/{mysfitId}/like']] #http://REPLACE_ME_NLB_DNS/mysfits/{mysfitId}/like
+            options:
+              summary: CORS support
+              description: 'Enable CORS by returning correct headers'
+              consumes:
+              - application/json
+              produces:
+              - application/json
+              tags:
+              - CORS
+              x-amazon-apigateway-integration:
+                type: mock
+                requestTemplates:
+                  application/json: |
+                    {
+                      "statusCode" : 200
+                    }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+                      method.response.header.Access-Control-Allow-Methods: "'*'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                    responseTemplates:
+                      application/json: "{}\n"
+              responses:
+                '200':
+                  description: Default response for CORS method
+                  headers:
+                    Access-Control-Allow-Headers:
+                      type: string
+                    Access-Control-Allow-Methods:
+                      type: string
+                    Access-Control-Allow-Origin:
+                      type: string
+  
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      MethodSettings:
+        - DataTraceEnabled: true
+          HttpMethod: "*"
+          ResourcePath: "/*"
+      RestApiId: !Ref MyRestAPI
+ 
+
+  ApiDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    Properties:
+      Description: Swagger API Deployment
+      RestApiId: !Ref MyRestAPI #required
+      StageName: prod
+      
+  MyVpclink:
+    Type: AWS::ApiGateway::VpcLink
+    Properties: 
+      Description: MysfitsApiVpcLink
+      Name: MysfitsApiVpcLink
+      TargetArns: 
+        - !Ref  PublicNetworkLoadBalancer                        
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UsernameConfiguration: 
+        CaseSensitive: false
+      AutoVerifiedAttributes:
+        - email
+      UserPoolName: !Sub ${CognitoDomain}-user-pool
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+          
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: True
+          RequireNumbers: True
+          RequireSymbols: False
+          RequireUppercase: True
+     
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: Myweb-userclient
+      GenerateSecret: False
+      WriteAttributes:
+        - email
+      ReadAttributes:
+        - email
+      RefreshTokenValidity: 1
+      UserPoolId: !Ref UserPool
+      
+
+  MyDynamoDB:
+    Type: "AWS::DynamoDB::Table"
+    DeletionPolicy: Delete
+    Properties:
+      TableName: MysfitsTable
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+      - AttributeName: MysfitId
+        AttributeType: S
+      - AttributeName: GoodEvil
+        AttributeType: S
+      - AttributeName: LawChaos
+        AttributeType: S
+      KeySchema:
+      - AttributeName: MysfitId
+        KeyType: HASH
+      GlobalSecondaryIndexes:
+      - IndexName: LawChaosIndex
+        KeySchema:
+        - AttributeName: LawChaos
+          KeyType: HASH
+        - AttributeName: MysfitId
+          KeyType: RANGE
+        Projection:
+          ProjectionType: ALL
+        ProvisionedThroughput:
+          ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+      - IndexName: GoodEvilIndex
+        KeySchema:
+        - AttributeName: GoodEvil
+          KeyType: HASH
+        - AttributeName: MysfitId
+          KeyType: RANGE
+        Projection:
+          ProjectionType: ALL
+        ProvisionedThroughput:
+          ReadCapacityUnits: 5
+          WriteCapacityUnits: 5
+
+  MyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ServiceName
+      AccessControl: PublicRead
+      WebsiteConfiguration:
+        IndexDocument: index.html
+  MyBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      PolicyDocument:
+        Id: MyPolicy
+        Version: 2012-10-17
+        Statement:
+          - Sid: PublicReadForGetBucketObjects
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref MyBucket
+                - /*
+      Bucket: !Ref MyBucket
+
+  MyArtefactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: ${ServiceName}-pipeline 
+      AccessControl: PublicRead
+      WebsiteConfiguration:
+        IndexDocument: index.html
+  MyArtefactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      PolicyDocument:
+        Id: MyPolicy
+        Version: 2012-10-17
+        Statement:
+          - Sid: WhitelistedGet
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt  'MythicalMysfitsServiceCodeBuildServiceRole.Arn'
+                - !GetAtt  'MythicalMysfitsServiceCodePipelineServiceRole.Arn'
+            Action: 
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+              - 's3:GetBucketVersioning'
+            Resource:  
+              - !Sub 'arn:aws:s3:::${ServiceName}-pipeline'
+              - !Sub 'arn:aws:s3:::${ServiceName}-pipeline/*'
+          - Sid: WhitelistedPut
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt  'MythicalMysfitsServiceCodeBuildServiceRole.Arn'
+                - !GetAtt  'MythicalMysfitsServiceCodePipelineServiceRole.Arn'
+            Action: 
+              - 's3:PutObject'
+            Resource:  
+              - !Sub 'arn:aws:s3:::${ServiceName}-pipeline'
+              - !Sub 'arn:aws:s3:::${ServiceName}-pipeline/*'
+      Bucket: !Ref MyArtefactBucket
+          
+
+
+  MyRepository: 
+    Type: AWS::ECR::Repository
+    Properties: 
+      RepositoryName: "mehmet/service"
+      RepositoryPolicyText: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Sid: AllowPushPull
+            Effect: Allow
+            Principal: 
+              AWS: 
+                - !GetAtt 'MythicalMysfitsServiceCodeBuildServiceRole.Arn'
+            Action: 
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchGetImage"
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:PutImage"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:UploadLayerPart"
+              - "ecr:CompleteLayerUpload"   
+      
+  MysfitsNotebookRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: 'MysfitsNotbookRole'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  MysfitsNotebookPolicy:
+    Type: 'AWS::IAM::Policy'
+    DependsOn:
+      - MysfitsNotebookRole
+    Properties:
+      PolicyName: mysfits_notebook_policy
+      Roles:
+        - !Ref MysfitsNotebookRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Action:
+            - 'sagemaker:*'
+            - 'ecr:GetAuthorizationToken'
+            - 'ecr:GetDownloadUrlForLayer'
+            - 'ecr:BatchGetImage'
+            - 'ecr:BatchCheckLayerAvailability'
+            - 'cloudwatch:PutMetricData'
+            - 'logs:CreateLogGroup'
+            - 'logs:CreateLogStream'
+            - 'logs:DescribeLogStreams'
+            - 'logs:PutLogEvents'
+            - 'logs:GetLogEvents'
+            - 's3:CreateBucket'
+            - 's3:ListBucket'
+            - 's3:GetBucketLocation'
+            - 's3:GetObject'
+            - 's3:PutObject'
+            - 's3:DeleteObject'
+          Resource: '*'
+        - Effect: Allow
+          Action:
+            - 'iam:PassRole'
+          Resource: '*'
+          Condition:
+            StringEquals:
+              iam:PassedToService: 'sagemaker.amazonaws.com'
+
+  # This is an IAM role which authorizes ECS to manage resources on your
+  # account on your behalf, such as updating your load balancer with the
+  # details of where your containers are, so that traffic can reach your
+  # containers.
+  EcsServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ecs.amazonaws.com
+            - ecs-tasks.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              # Rules which allow ECS to attach network interfaces to instances
+              # on your behalf in order for awsvpc networking mode to work right
+              - 'ec2:AttachNetworkInterface'
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:CreateNetworkInterfacePermission'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:DeleteNetworkInterfacePermission'
+              - 'ec2:Describe*'
+              - 'ec2:DetachNetworkInterface'
+
+              # Rules which allow ECS to update load balancers on your behalf
+              # with the information about how to send traffic to your containers
+              - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+              - 'elasticloadbalancing:DeregisterTargets'
+              - 'elasticloadbalancing:Describe*'
+              - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+              - 'elasticloadbalancing:RegisterTargets'
+
+              # Rules which allow ECS to run tasks that have IAM roles assigned to them.
+              - 'iam:PassRole'
+
+              # Rules that let ECS interact with container images.
+              - 'ecr:GetAuthorizationToken'
+              - 'ecr:BatchCheckLayerAvailability'
+              - 'ecr:GetDownloadUrlForLayer'
+              - 'ecr:BatchGetImage'
+
+              # Rules that let ECS create and push logs to CloudWatch.
+              - 'logs:DescribeLogStreams'
+              - 'logs:CreateLogStream'
+              - 'logs:CreateLogGroup'
+              - 'logs:PutLogEvents'
+
+            Resource: '*'
+
+  # This is a role which is used by the ECS tasks. Tasks in Amazon ECS define
+  # the containers that should be deployed togehter and the resources they
+  # require from a compute/memory perspective. So, the policies below will define
+  # the IAM permissions that our Mythical Mysfits docker containers will have.
+  # If you attempted to write any code for the Mythical Mysfits service that
+  # interacted with different AWS service APIs, these roles would need to include
+  # those as allowed actions.
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                # Allow the ECS Tasks to download images from ECR
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+
+                # Allow the ECS tasks to upload logs to CloudWatch
+                - 'logs:CreateLogStream'
+                - 'logs:CreateLogGroup'
+                - 'logs:PutLogEvents'
+              Resource: '*'
+
+            - Effect: Allow
+              Action:
+                # Allows the ECS tasks to interact with only the MysfitsTable
+                # in DynamoDB
+                - 'dynamodb:Scan'
+                - 'dynamodb:Query'
+                - 'dynamodb:UpdateItem'
+                - 'dynamodb:GetItem'
+              Resource: 'arn:aws:dynamodb:*:*:table/MysfitsTable*'
+
+  # An IAM role that allows the AWS CodePipeline service to perform it's
+  # necessary actions. We have intentionally left permissions on this role
+  # that will not be used by the CodePipeline service during this workshop.
+  # This will allow you to more simply use CodePipeline in the future should
+  # you want to use the service for Pipelines that interact with different
+  # AWS services than the ones used in this workshop.
+  MythicalMysfitsServiceCodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MythicalMysfitsServiceCodePipelineServiceRole
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - codepipeline.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: MythicalMysfitsService-codepipeline-service-policy
+        PolicyDocument:
+          Statement:
+          - Action:
+            - codecommit:GetBranch
+            - codecommit:GetCommit
+            - codecommit:UploadArchive
+            - codecommit:GetUploadArchiveStatus
+            - codecommit:CancelUploadArchive
+            Resource: "*"
+            Effect: Allow
+          - Action:
+            - s3:GetObject
+            - s3:GetObjectVersion
+            - s3:GetBucketVersioning
+            Resource: "*"
+            Effect: Allow
+          - Action:
+            - s3:PutObject
+            Resource:
+            - arn:aws:s3:::*
+            Effect: Allow
+          - Action:
+            - elasticloadbalancing:*
+            - autoscaling:*
+            - cloudwatch:*
+            - ecs:*
+            - codebuild:*
+            - iam:PassRole
+            Resource: "*"
+            Effect: Allow
+          Version: "2012-10-17"
+
+  # An IAM role that allows the AWS CodeBuild service to perform the actions
+  # required to complete a build of our source code retrieved from CodeCommit,
+  # and push the created image to ECR.
+  MythicalMysfitsServiceCodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MythicalMysfitsServiceCodeBuildServiceRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: "MythicalMysfitsService-CodeBuildServicePolicy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+            - "codecommit:ListBranches"
+            - "codecommit:ListRepositories"
+            - "codecommit:BatchGetRepositories"
+            - "codecommit:Get*"
+            - "codecommit:GitPull"
+            Resource:
+            - Fn::Sub: arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:MythicalMysfitsServiceRepository
+          - Effect: "Allow"
+            Action:
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+            - "s3:PutObject"
+            - "s3:GetObject"
+            - "s3:GetObjectVersion"
+            - "s3:ListBucket"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+            - "ecr:InitiateLayerUpload"
+            - "ecr:GetAuthorizationToken"
+            - "ecr:PutImage"
+            - "ecr:UploadLayerPart"
+            - "ecr:CompleteLayerUpload"
+            - "ecr:BatchCheckLayerAvailability"
+            - "ecr:BatchGetImage"
+            Resource: "*"
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [/ecs/, !Ref ServiceName, TaskDefinition]]
+
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: MyCluster
+
+  TaskDefinition:
+    DependsOn: DockerMachine  
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ServiceName
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref EcsServiceRole
+      TaskRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions:
+        - Name: !Ref AppName
+          MountPoints: 
+          - SourceVolume: "my-vol"
+            ContainerPath: "/var/lib/my-vol"
+          Cpu: !Ref ContainerCpu
+          Memory: !Ref ContainerMemory
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/mehmet/service:latest
+          PortMappings:
+            - ContainerPort: !Ref AppContainerPort
+              Protocol: http
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: ecs
+          Essential: true
+      Volumes: 
+      - Name: "my-vol"
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+          - !Ref FargateContainerSecurityGroup
+          Subnets:
+          - !Ref  PrivateSubnetOne
+          - !Ref  PrivateSubnetTwo 
+      LoadBalancers:
+        - ContainerName: !Ref AppName
+          ContainerPort: !Ref AppContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      TaskDefinition: !Ref TaskDefinition
+      ServiceName: !Ref ServiceName
+
+  PublicNetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets:
+        # The load balancer is placed into the public subnets, so that traffic
+        # from the internet can reach the load balancer directly via the internet gateway
+        - !Ref PublicSubnetOne
+        - !Ref PublicSubnetTwo
+      Type: network  
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthyThresholdCount: 2
+      TargetType: ip
+      Name: !Ref 'ServiceName'
+      Port: !Ref 'AppContainerPort'
+      Protocol: TCP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref  'VPC'
+  ALBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions: #required
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref PublicNetworkLoadBalancer #required
+      Port: 80 #required
+      Protocol: TCP #required
+
+  MyCodecommitRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties: 
+      RepositoryName: MythicalMysfitsService-Repository
+
+  MyCodecommitStreamingRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties: 
+      RepositoryName: MythicalMysfitsStreamingService-Repository
+
+  MyCodecommitQuestionsServiceRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties: 
+      RepositoryName: MythicalMysfitsQuestionsService-Repository
+
+  MyCodecommitRecomwndationServiceRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties: 
+      RepositoryName: MythicalMysfitsRecommendationService-Repository
+
+  MyCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: MythicalMysfitsServiceCodeBuildProject
+      Description: A description about my project
+      ServiceRole: !GetAtt MythicalMysfitsServiceCodeBuildServiceRole.Arn
+      Artifacts:
+        Type: no_artifacts
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/python:3.5.2
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Value: !Sub ${AWS::AccountId}
+          - Name: AWS_DEFAULT_REGION
+            Value: !Sub ${AWS::Region}
+      Source:
+        Location: !Sub https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/MythicalMysfitsService-Repository
+        Type: CODECOMMIT
+  
+  MyPipeline: 
+    Type: AWS::CodePipeline::Pipeline 
+    Properties: 
+      RoleArn: !GetAtt MythicalMysfitsServiceCodePipelineServiceRole.Arn
+      Stages: 
+        - 
+          Name: Source 
+          Actions: 
+            - 
+              Name: Source
+              InputArtifacts: []
+              ActionTypeId: 
+                Category: Source 
+                Owner: AWS 
+                Version: 1 
+                Provider: CodeCommit 
+              OutputArtifacts: 
+                - 
+                  Name: MythicalMysfitsService-SourceArtifact 
+              Configuration: 
+                BranchName: master 
+                RepositoryName: MythicalMysfitsService-Repository
+              RunOrder: 1 
+        - 
+          Name: Build 
+          Actions: 
+            - 
+              Name: Build 
+              ActionTypeId: 
+                Category: Build 
+                Owner: AWS 
+                Version: 1 
+                Provider: CodeBuild
+              OutputArtifacts: 
+                - 
+                  Name: MythicalMysfitsService-BuildArtifact
+              InputArtifacts: 
+                - 
+                  Name: MythicalMysfitsService-SourceArtifact
+              Configuration: 
+                ProjectName: MythicalMysfitsServiceCodeBuildProject
+              RunOrder: 1 
+        - 
+          Name: Deploy 
+          Actions: 
+            - 
+              Name: Deploy
+              InputArtifacts: 
+                - 
+                  Name: MythicalMysfitsService-BuildArtifact 
+              ActionTypeId: 
+                Category: Deploy 
+                Owner: AWS 
+                Version: 1
+                Provider: ECS 
+              Configuration: 
+                ClusterName: MyCluster
+                ServiceName: !Ref ServiceName 
+                FileName: imagedefinitions.json 
+              RunOrder: 1 
+      ArtifactStore: 
+        Type: S3 
+        Location: !Ref MyArtefactBucket
+  
+
+
+
+# These are the values output by the CloudFormation template. Be careful
+# about changing any of them, because of them are exported with specific
+# names so that the other task related CF templates can use them.
+Outputs:
+
+  NLBDnsName:
+    Description: URL to access the Application Load Balance
+    Value: !Join 
+      - ''
+      - - 'http://'
+        - !GetAtt 
+          - PublicNetworkLoadBalancer
+          - DNSName
+  S3DnsName:
+    Description: URL to access the S3 bucket
+    Value:  !Sub http://${ServiceName}.s3-website.${AWS::Region}.amazonaws.com
+  VPCId:
+    Description: The VPC ID to use for public web servers
+    Value: !Ref 'VPC'
+    Export:
+      Name: !Join [ ':', [ !Ref 'AWS::StackName', 'VPCId' ] ]
+  PublicSubnetOne:
+    Description: The subnet ID to use for public web servers
+    Value: !Ref 'PublicSubnetOne'
+    Export:
+      Name: !Join [ ':', [ !Ref 'AWS::StackName', 'PublicSubnetOne' ] ]
